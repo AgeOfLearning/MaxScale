@@ -22,7 +22,7 @@
 #include <skygw_utils.h>
 #include <log_manager.h>
 #include <string.h>
-#include <regex.h>
+#include <pcre.h>
 #include <atomic.h>
 #include "maxconfig.h"
 
@@ -65,7 +65,7 @@ static	void	setDownstream(FILTER *instance, void *fsession, DOWNSTREAM *downstre
 static	int	routeQuery(FILTER *instance, void *fsession, GWBUF *queue);
 static	void	diagnostic(FILTER *instance, void *fsession, DCB *dcb);
 
-static char	*regex_replace(char *sql, regex_t *re, char *replace);
+static char	*regex_replace(char *sql, pcre *re, pcre_extra *study, char *replace);
 
 static FILTER_OBJECT MyObject = {
     createInstance,
@@ -87,7 +87,8 @@ typedef struct {
 	char	*user;		/* User name to restrict matches */
 	char	*match;		/* Regular expression to match */
 	char	*replace;	/* Replacement text */
-	regex_t	re;		/* Compiled regex text */
+	pcre	*re;		/* Compiled regex text */
+        pcre_extra *study;
 	FILE* logfile;
 	bool log_trace;
 } REGEX_INSTANCE;
@@ -153,8 +154,10 @@ static	FILTER	*
 createInstance(char **options, FILTER_PARAMETER **params)
 {
 REGEX_INSTANCE	*my_instance;
-int		i, cflags = REG_ICASE;
+int		i, errloc, cflags = PCRE_CASELESS;
 char		*logfile = NULL;
+const char            *errmsg;
+
 	if ((my_instance = calloc(1, sizeof(REGEX_INSTANCE))) != NULL)
 	{
 		my_instance->match = NULL;
@@ -193,11 +196,11 @@ char		*logfile = NULL;
 			{
 				if (!strcasecmp(options[i], "ignorecase"))
 				{
-					cflags |= REG_ICASE;
+					cflags |= PCRE_CASELESS;
 				}
 				else if (!strcasecmp(options[i], "case"))
 				{
-					cflags &= ~REG_ICASE;
+					cflags &= ~PCRE_CASELESS;
 				}
 				else
 				{
@@ -216,17 +219,28 @@ char		*logfile = NULL;
 			return NULL;
 		}
 
-		if (regcomp(&my_instance->re, my_instance->match, REG_ICASE))
+		if ((my_instance->re = pcre_compile(my_instance->match, cflags, &errmsg, &errloc, NULL)) == NULL)
 		{
 			LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-				"regexfilter: Invalid regular expression '%s'.\n",
-					my_instance->match)));
+				"Error: regexfilter: Compiling regular expression '%s' failed at %d: %s\n",
+					my_instance->match, errloc, errmsg)));
 			free(my_instance->match);
 			free(my_instance->replace);
 			free(my_instance);
 			free(logfile);
 			return NULL;
 		}
+
+                if((my_instance->study = pcre_study(my_instance->re, 0, &errmsg)) == NULL)
+                {
+                    skygw_log_write(LE, "Error: regexfilter: Failed to study regular expression: %s", errmsg);
+                    pcre_free(my_instance->re);
+                    free(my_instance->match);
+                    free(my_instance->replace);
+                    free(my_instance);
+                    free(logfile);
+                    return NULL;
+                }
 
 		if(logfile != NULL)
 		{
@@ -351,8 +365,10 @@ char		*sql, *newsql;
 		}
 		if ((sql = modutil_get_SQL(queue)) != NULL)
 		{
-			newsql = regex_replace(sql, &my_instance->re,
-						my_instance->replace);
+			newsql = regex_replace(sql,
+                                         my_instance->re,
+                                         my_instance->study,
+                                         my_instance->replace);
 			if (newsql)
 			{
 				queue = modutil_replace_SQL(queue, newsql);
@@ -414,8 +430,35 @@ REGEX_SESSION	*my_session = (REGEX_SESSION *)fsession;
 				my_instance->user);
 }
 
+void regex_replace_group(int group, char *sql, const char *replace)
+{
+    char cgroup[128];
+    pcre* re;
+    int erroffset, replen, slen, rc, ovec[30];
+    const char* errptr;
+
+    slen = strlen(sql);
+    snprintf(cgroup, sizeof(cgroup), "[\\\\]%d", group);
+    replen = strlen(replace) - 2;
+
+    if((re = pcre_compile((const char*) cgroup, 0, &errptr, &erroffset, NULL)))
+    {
+
+        while ((rc = pcre_exec(re, NULL, sql, slen, 0, 0, ovec, 30)) == 1)
+        {
+            memmove(&sql[ovec[1] + replen], &sql[ovec[1]], slen - ovec[1]);
+            memcpy(&sql[ovec[0]], replace, strlen(replace));
+            slen = strlen(sql);
+
+        }
+    }
+    else
+    {
+        skygw_log_write(LE, "Error: Failed to compile subgroup matching regex: %d", errptr);
+    }
+}
 /**
- * Perform a regular expression match and subsititution on the SQL
+ * Perform a regular expression match and substitution on the SQL
  *
  * @param	sql	The original SQL text
  * @param	re	The compiled regular expression
@@ -423,68 +466,70 @@ REGEX_SESSION	*my_session = (REGEX_SESSION *)fsession;
  * @return	The replaced text or NULL if no replacement was done.
  */
 static char *
-regex_replace(char *sql, regex_t *re, char *replace)
+regex_replace(char *sql, pcre *re, pcre_extra* study, char *replace)
 {
-char		*orig, *result, *ptr;
-int		i, res_size, res_length, rep_length;
-int		last_match, length;
-regmatch_t	match[10];
+    char	*orig, *result = NULL, *ptr, *expanded;
+    const char  **strlist;
+    int		i, res_size, rep_length, rc;
+    int		length;
+    int         *ovector;
+    int         ovec_multiplier = 12;
 
-	if (regexec(re, sql, 10, match, 0))
-	{
-		return NULL;
-	}
+    if((ovector = malloc((3 * ovec_multiplier) * sizeof(int))) == NULL)
+    {
+        skygw_log_write(LE, "[%s] Error: Memory allocation failed.", __FUNCTION__);
+        return NULL;
+    }
+
+    do
+    {
+        rc = pcre_exec(re, study, sql, strlen(sql), 0, 0, ovector, 3 * ovec_multiplier);
+
+        if (rc < 0 && rc != PCRE_ERROR_NOMATCH)
+        {
+            skygw_log_write(LE, "Error: Regex execution failed with error code %d", rc);
+        }
+        else if (rc == 0)
+        {
+            ovec_multiplier++;
+            if((ovector = realloc(ovector,(3 * ovec_multiplier) * sizeof(int))) == NULL)
+            {
+                skygw_log_write(LE, "[%s] Error: Memory reallocation failed.", __FUNCTION__);
+                return NULL;
+            }
+        }
+    }while (rc == 0);
+
+    if (rc > 0)
+    {
 	length = strlen(sql);
-	
 	res_size = 2 * length;
 	result = (char *)malloc(res_size);
-	res_length = 0;
-	rep_length = strlen(replace);
-	last_match = 0;
 	
-	for (i = 0; i < 10; i++)
-	{
-		if (match[i].rm_so != -1)
-		{
-			ptr = &result[res_length];
-			if (last_match < match[i].rm_so)
-			{
-				int to_copy = match[i].rm_so - last_match;
-				if (last_match + to_copy > res_size)
-				{
-					res_size = last_match + to_copy + length;
-					result = (char *)realloc(result, res_size);
-				}
-				memcpy(ptr, &sql[last_match], to_copy);
-				res_length += to_copy;
-			}
-			last_match = match[i].rm_eo;
-			if (res_length + rep_length > res_size)
-			{
-				res_size += rep_length;
-				result = (char *)realloc(result, res_size);
-			}
-			ptr = &result[res_length];
-			memcpy(ptr, replace, rep_length);
-			res_length += rep_length;
-		}
-	}
+        expanded = malloc(sizeof(char)*(strlen(replace) * 2));
+        strcpy(expanded, replace);
+        /** The regex has capture groups. Replace only those groups that are
+         * found in the replacement string. */
+        if (rc > 1)
+        {
+            pcre_get_substring_list(sql, ovector, rc, &strlist);
 
-	if (last_match < length)
-	{
-		int to_copy = length - last_match;
-		if (last_match + to_copy > res_size)
-		{
-			res_size = last_match + to_copy + 1;
-			result = (char *)realloc(result, res_size);
-		}
-		ptr = &result[res_length];
-		memcpy(ptr, &sql[last_match], to_copy);
-		res_length += to_copy;
-	}
-	result[res_length] = 0;
+            for (int i = 1; i <= rc && strlist[i]; i++)
+            {
+                regex_replace_group(i, expanded, strlist[i]);
+            }
 
-	return result;
+            pcre_free_substring_list(strlist);
+
+        }
+        rep_length = strlen(expanded);
+        memcpy(result, sql, ovector[0]);
+        memcpy(result + ovector[0], expanded, rep_length);
+        memcpy(result + ovector[0] + rep_length, sql + ovector[1], length - ovector[1]);
+        result[ovector[0] + rep_length + length - ovector[1]] = '\0';
+    }
+    free(ovector);
+    return result;
 }
 
 /**
