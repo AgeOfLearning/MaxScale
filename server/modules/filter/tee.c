@@ -1118,7 +1118,15 @@ static int clientReply(FILTER* instance, void *session, GWBUF *reply)
     }
 
 retblock:
+#ifdef SS_DEBUG
+    skygw_log_write(LT, "Status: Parent[%s] Child[%s]",
+                    my_session->waiting[PARENT] ? "WAITING" : "DONE",
+                    my_session->waiting[CHILD] ? "WAITING" : "DONE");
+    skygw_log_write(LT, "Replies: Parent[%d] Child[%d]",
+                    my_session->replies[PARENT],
+                    my_session->replies[CHILD]);
 
+#endif
     spinlock_release(&my_session->tee_lock);
 
     return rc;
