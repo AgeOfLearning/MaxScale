@@ -20,7 +20,7 @@ elseif(WITH_TCMALLOC)
   target_link_libraries(maxscale ${TCMALLOC_LIBRARIES})
 endif()
 message(STATUS "PCRE2: ${PCRE2_LIBRARIES}")
-target_link_libraries(maxscale ${EMBEDDED_LIB} ${PCRE_LINK_FLAGS} ${PCRE2_LIBRARIES} ${CURL_LIBRARIES} log_manager utils ssl aio pthread crypt dl crypto inih z rt m stdc++)
+target_link_libraries(maxscale ${EMBEDDED_LIB} ${PCRE_LINK_FLAGS} ${CURL_LIBRARIES} log_manager utils ssl aio pthread crypt dl crypto inih z rt m stdc++)
 install(TARGETS maxscale DESTINATION ${MAXSCALE_BINDIR})
 
 add_executable(maxkeys maxkeys.c secrets.c utils.c gwdirs.c)

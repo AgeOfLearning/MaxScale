@@ -456,7 +456,6 @@ regex_replace(char *sql, pcre2_code *re, pcre2_match_data *match_data, char *rep
 {
     char *result = NULL;
     size_t result_size;
-    int rc;
 
     /** This should never fail with rc == 0 because we used pcre2_match_data_create_from_pattern() */
     if (pcre2_match(re, (PCRE2_SPTR)sql, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL))
@@ -466,7 +465,7 @@ regex_replace(char *sql, pcre2_code *re, pcre2_match_data *match_data, char *rep
 
         while (result && 
                pcre2_substitute(re, (PCRE2_SPTR)sql, PCRE2_ZERO_TERMINATED, 0,
-                                PCRE2_SUBSTITUTE_GLOBAL, NULL, NULL,
+                                PCRE2_SUBSTITUTE_GLOBAL, match_data, NULL,
                                 (PCRE2_SPTR)replace, PCRE2_ZERO_TERMINATED,
                                 (PCRE2_UCHAR*)result, (PCRE2_SIZE*)&result_size) == PCRE2_ERROR_NOMEMORY)
         {
