@@ -63,6 +63,10 @@
  * @endverbatim
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -334,7 +338,6 @@ char	*sep = " 	,=";
 char	*word, *brkb;
 int	query_len;
 char    *ptr;
-extern  char *strcasestr();
 
 	qtext = GWBUF_DATA(queue);
 	query_len = extract_field((uint8_t *)qtext, 24) - 1;

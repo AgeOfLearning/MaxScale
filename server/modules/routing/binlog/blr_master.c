@@ -103,7 +103,7 @@ static void blr_log_identity(ROUTER_INSTANCE *router);
 static void blr_distribute_error_message(ROUTER_INSTANCE *router, char *message, char *state, unsigned int err_code);
 
 static int keepalive = 1;
-
+extern ROUTER_SLAVE dummy_router_slave;
 /**
  * blr_start_master - controls the connection of the binlog router to the
  * master MySQL server and triggers the slave registration process for
@@ -159,6 +159,7 @@ DCB	*client;
 		return;
 	}
 	client->session = router->session;
+    client->session->router_session = &dummy_router_slave;
 	if ((router->master = dcb_connect(router->service->dbref->server, router->session, BLR_PROTOCOL)) == NULL)
 	{
 		char *name;

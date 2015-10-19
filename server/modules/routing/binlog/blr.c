@@ -818,7 +818,11 @@ static void freeSession(
 ROUTER_INSTANCE 	*router = (ROUTER_INSTANCE *)router_instance;
 ROUTER_SLAVE		*slave = (ROUTER_SLAVE *)router_client_ses;
 int			prev_val;
-        
+
+        if(slave == &dummy_router_slave)
+        {
+            return;
+        }
         prev_val = atomic_add(&router->stats.n_slaves, -1);
         ss_dassert(prev_val > 0);
         
@@ -892,6 +896,13 @@ ROUTER_SLAVE	 *slave = (ROUTER_SLAVE *)router_session;
 		blr_master_reconnect(router);
 		return;
 	}
+
+    if(slave == &dummy_router_slave)
+    {
+        skygw_log_write(LE, "Binlog router dummy session was closed.");
+        return;
+    }
+
         CHK_CLIENT_RSES(slave);
 
         /**

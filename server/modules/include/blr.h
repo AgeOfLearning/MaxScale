@@ -529,6 +529,10 @@ static char *blrs_states[] = { "Created", "Unregistered", "Registered",
 #define	EXTRACT32(x)		extract_field((x), 32)
 #endif
 
+/** The fake session that is used to fetch binlogs from the master also needs to
+ * have a fake router session */
+static ROUTER_SLAVE dummy_router_slave;
+
 /*
  * Externals within the router
  */
