@@ -46,6 +46,7 @@
  *					If set those values are sent to slaves instead of
  *					saved master responses
  * 23/08/2015	Massimiliano Pinto	Added strerror_r
+ * 09/09/2015   Martin Brampton         Modify error handler
  * 30/09/2015	Massimiliano Pinto	Addition of send_slave_heartbeat option
  *
  * @endverbatim
@@ -1385,8 +1386,8 @@ int	len;
  * @param       router_session  The router session
  * @param       message         The error message to reply
  * @param       backend_dcb     The backend DCB
- * @param       action     	The action: REPLY, REPLY_AND_CLOSE, NEW_CONNECTION
- * @param	succp		Result of action
+ * @param       action     	The action: ERRACT_NEW_CONNECTION or ERRACT_REPLY_CLIENT
+ * @param	succp		Result of action: true iff router can continue
  *
  */
 static  void
@@ -1398,12 +1399,6 @@ socklen_t	len;
 char		msg[BLRM_STRERROR_R_MSG_SIZE + 1 + 5] = "";
 char 		*errmsg;
 unsigned long	mysql_errno;
-
-	if (action == ERRACT_RESET)
-	{
-		backend_dcb->dcb_errhandle_called = false;
-		return;
-	}
 
 	/** Don't handle same error twice on same DCB */
         if (backend_dcb->dcb_errhandle_called)
@@ -1458,6 +1453,7 @@ unsigned long	mysql_errno;
 	if (errmsg)
 		free(errmsg);
 	*succp = true;
+        dcb_close(backend_dcb);
 	LOGIF(LM, (skygw_log_write_flush(
 		LOGFILE_MESSAGE,
 		"%s: Master %s disconnected after %ld seconds. "

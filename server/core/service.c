@@ -362,7 +362,6 @@ GWPROTOCOL	*funcs;
 		goto retblock;
 	}
 	memcpy(&(port->listener->func), funcs, sizeof(GWPROTOCOL));
-	port->listener->session = NULL;
 	
 	if (port->address)
 		sprintf(config_bind, "%s:%d", port->address, port->port);
