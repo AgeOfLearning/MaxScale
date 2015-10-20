@@ -67,13 +67,16 @@
  * 06/03/2014	Massimiliano Pinto	Server connection counter is now updated in closeSession
  * 24/06/2014	Massimiliano Pinto	New rules for selecting the Master server
  * 27/06/2014	Mark Riddoch		Addition of server weighting
- * 11/06/2015   Martin Brampton     Remove decrement n_current (moved to dcb.c)
+ * 11/06/2015   Martin Brampton         Remove decrement n_current (moved to dcb.c)
+ * 09/09/2015   Martin Brampton         Modify error handler
+ * 25/09/2015   Martin Brampton         Block callback processing when no router session in the DCB
  *
  * @endverbatim
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <service.h>
 #include <server.h>
 #include <router.h>
@@ -840,57 +843,67 @@ clientReply(
  * @param       router_session  The router session
  * @param       message         The error message to reply
  * @param       backend_dcb     The backend DCB
- * @param       action     	The action: REPLY, REPLY_AND_CLOSE, NEW_CONNECTION
+ * @param       action     	The action: ERRACT_NEW_CONNECTION or ERRACT_REPLY_CLIENT
+ * @param	succp		Result of action: true if router can continue
  *
  */
 static void handleError(
-	ROUTER           *instance,
-	void             *router_session,
-	GWBUF            *errbuf,
-	DCB              *backend_dcb,
-	error_action_t   action,
-	bool             *succp)
+    ROUTER           *instance,
+    void             *router_session,
+    GWBUF            *errbuf,
+    DCB              *backend_dcb,
+    error_action_t   action,
+    bool             *succp)
 
 {
-	DCB             *client_dcb;
-	SESSION         *session = backend_dcb->session;
-	session_state_t sesstate;
+    DCB             *client_dcb;
+    SESSION         *session = backend_dcb->session;
+    session_state_t sesstate;
+    ROUTER_CLIENT_SES *router_cli_ses = (ROUTER_CLIENT_SES *)router_session;
 
-	/** Reset error handle flag from a given DCB */
-	if (action == ERRACT_RESET)
-	{
-		backend_dcb->dcb_errhandle_called = false;
-		return;
-	}
+    /** Don't handle same error twice on same DCB */
+    if (backend_dcb->dcb_errhandle_called)
+    {
+        /** we optimistically assume that previous call succeed */
+        *succp = true;
+        return;
+    }
+    else
+    {
+        backend_dcb->dcb_errhandle_called = true;
+    }
+    spinlock_acquire(&session->ses_lock);
+    sesstate = session->state;
+    client_dcb = session->client;
 	
-	/** Don't handle same error twice on same DCB */
-	if (backend_dcb->dcb_errhandle_called)
-	{
-		/** we optimistically assume that previous call succeed */
-		*succp = true;
-		return;
-	}
-	else
-	{
-		backend_dcb->dcb_errhandle_called = true;
-	}
-	spinlock_acquire(&session->ses_lock);
-	sesstate = session->state;
-	client_dcb = session->client;
-	
-	if (sesstate == SESSION_STATE_ROUTER_READY)
-	{
-		CHK_DCB(client_dcb);
-		spinlock_release(&session->ses_lock);	
-		client_dcb->func.write(client_dcb, gwbuf_clone(errbuf));
-	}
-	else 
-	{
-		spinlock_release(&session->ses_lock);
-	}
-	
-	/** false because connection is not available anymore */
-	*succp = false;
+    if (sesstate == SESSION_STATE_ROUTER_READY)
+    {
+        CHK_DCB(client_dcb);
+        spinlock_release(&session->ses_lock);	
+        client_dcb->func.write(client_dcb, gwbuf_clone(errbuf));
+    }
+    else 
+    {
+        spinlock_release(&session->ses_lock);
+    }
+
+    if (router_cli_ses && router_cli_ses->backend_dcb) {
+        if (backend_dcb != router_cli_ses->backend_dcb)
+        {
+            /* Linkages have gone badly wrong */
+            LOGIF(LE, (skygw_log_write(LOGFILE_ERROR,
+                "Read Connection Router error in handleError: router client "
+                "session DCB %p is not null, but does not match backend DCB %p "
+                "either. \n",
+                router_cli_ses->backend_dcb,
+                backend_dcb)));
+        }
+        router_cli_ses->backend_dcb = NULL;
+    }
+    dcb_close(backend_dcb);
+
+    /** false because connection is not available anymore */
+    *succp = false;
 }
 
 /** to be inline'd */
@@ -998,6 +1011,14 @@ static int handle_state_switch(DCB* dcb,DCB_REASON reason, void * routersession)
     SERVICE* service = session->service;
     ROUTER* router = (ROUTER *)service->router;
 
+    if (NULL == dcb->session->router_session  && DCB_REASON_ERROR != reason)
+    {
+        /* 
+         * We cannot handle a DCB that does not have a router session,
+         * except in the case where error processing is invoked.
+         */
+        return 0;
+    }
     switch(reason)
     {
 	case DCB_REASON_CLOSE:
