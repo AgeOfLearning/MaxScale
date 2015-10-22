@@ -209,6 +209,10 @@ int route_single_query(TEE_INSTANCE* my_instance,
 		       GWBUF* clone);
 int reset_session_state(TEE_SESSION* my_session, GWBUF* buffer);
 void create_orphan(SESSION* ses);
+void process_first_reply(TEE_SESSION *my_session, uint8_t *ptr, int branch);
+GWBUF* get_complete_replies(TEE_SESSION* my_session, GWBUF* reply, int branch);
+bool reply_is_ready(TEE_SESSION *my_session);
+bool is_multipacket_reply(TEE_SESSION *my_session, uint8_t *ptr);
 
 static void
 orphan_free(void* data)
@@ -896,27 +900,94 @@ uint16_t get_response_flags(uint8_t* datastart, bool ok_packet)
  */
 static int clientReply(FILTER* instance, void *session, GWBUF *reply)
 {
-    int rc, branch, eof;
+    int rc = 1, branch, eof;
     TEE_SESSION *my_session = (TEE_SESSION *) session;
     bool route = false, mpkt;
     GWBUF *complete = NULL;
-    unsigned char *ptr;
-    uint16_t flags = 0;
+    uint8_t *ptr;
     int more_results = 0;
 
     spinlock_acquire(&my_session->tee_lock);
 
-    int min_eof = my_session->command != 0x04 ? 2 : 1;
+    if (my_session->active)
+    {
+        branch = instance == NULL ? CHILD : PARENT;
 
+        if ((complete = get_complete_replies(my_session, reply, branch)))
+        {
+            /** We have a complete reply packet */
+            ptr = (uint8_t*) complete->start;
+
+            if (my_session->replies[branch] == 0)
+            {
+                process_first_reply(my_session, ptr, branch);
+                more_results = is_multipacket_reply(my_session, ptr);
+            }
+
+            if (my_session->waiting[branch])
+            {
+                int min_eof = my_session->command != 0x04 ? 2 : 1;
+                eof = modutil_count_signal_packets(complete,
+                                                   my_session->use_ok,
+                                                   my_session->eof[branch] > 0,
+                                                   &more_results);
+                my_session->eof[branch] += eof;
+
+                if (my_session->eof[branch] >= min_eof)
+                {
+                    if (more_results && my_session->client_multistatement)
+                    {
+                        my_session->waiting[branch] = true;
+                        my_session->eof[branch] = 0;
+                    }
+                    else
+                    {
+                        my_session->waiting[branch] = false;
+                    }
+                }
+            }
+
+            if (branch == PARENT)
+            {
+                my_session->tee_replybuf = gwbuf_append(my_session->tee_replybuf, complete);
+            }
+            else
+            {
+                gwbuf_free(complete);
+            }
+
+            my_session->replies[branch]++;
+
+            if (reply_is_ready(my_session))
+            {
 #ifdef SS_DEBUG
-    ptr = (unsigned char*) reply->start;
-    skygw_log_write(LOGFILE_TRACE, "Tee clientReply [%s] [%s] [%s]",
-                    instance ? "parent" : "child",
-                    my_session->active ? "open" : "closed",
-                    PTR_IS_ERR(ptr) ? "ERR" : PTR_IS_OK(ptr) ? "OK" : "RSET");
+                skygw_log_write_flush(LT, "tee.c:[%d] Routing buffer '%p' parent(waiting [%s] replies [%d] eof[%d])"
+                                      " child(waiting [%s] replies[%d] eof [%d])",
+                                      my_session->d_id, my_session->tee_replybuf,
+                                      my_session->waiting[PARENT] ? "true" : "false",
+                                      my_session->replies[PARENT], my_session->eof[PARENT],
+                                      my_session->waiting[CHILD] ? "true" : "false",
+                                      my_session->replies[CHILD], my_session->eof[CHILD]);
 #endif
 
-    if (!my_session->active)
+                rc = my_session->up.clientReply(my_session->up.instance,
+                                                my_session->up.session,
+                                                my_session->tee_replybuf);
+                my_session->tee_replybuf = NULL;
+            }
+
+            if (my_session->queue &&
+                !my_session->waiting[PARENT] &&
+                !my_session->waiting[CHILD])
+            {
+                GWBUF* buffer = modutil_get_next_MySQL_packet(&my_session->queue);
+                GWBUF* clone = clone_query(my_session->instance, my_session, buffer);
+                reset_session_state(my_session, buffer);
+                route_single_query(my_session->instance, my_session, buffer, clone);
+            }
+        }
+    }
+    else
     {
         skygw_log_write(LOGFILE_TRACE, "Tee: Failed to return reply, session is closed");
         gwbuf_free(reply);
@@ -929,182 +1000,8 @@ static int clientReply(FILTER* instance, void *session, GWBUF *reply)
                                        my_session->up.session,
                                        errbuf);
         }
-        goto retblock;
     }
 
-    branch = instance == NULL ? CHILD : PARENT;
-
-    my_session->tee_partials[branch] = gwbuf_append(my_session->tee_partials[branch], reply);
-    my_session->tee_partials[branch] = gwbuf_make_contiguous(my_session->tee_partials[branch]);
-    complete = modutil_get_complete_packets(&my_session->tee_partials[branch]);
-
-    if (complete == NULL)
-    {
-        /** Incomplete packet */
-        skygw_log_write(LOGFILE_DEBUG, "tee.c: Incomplete packet, "
-                        "waiting for a complete packet before forwarding.");
-        rc = 1;
-        goto retblock;
-    }
-
-    complete = gwbuf_make_contiguous(complete);
-
-    if (my_session->tee_partials[branch] &&
-        GWBUF_EMPTY(my_session->tee_partials[branch]))
-    {
-        gwbuf_free(my_session->tee_partials[branch]);
-        my_session->tee_partials[branch] = NULL;
-    }
-
-    ptr = (unsigned char*) complete->start;
-
-    if (my_session->replies[branch] == 0)
-    {
-        skygw_log_write(LOGFILE_TRACE, "Tee: First reply to a query for [%s].", branch == PARENT ? "PARENT" : "CHILD");
-        /* Reply is in a single packet if it is an OK, ERR or LOCAL_INFILE packet.
-         * Otherwise the reply is a result set and the amount of packets is unknown.
-         */
-        if (PTR_IS_ERR(ptr) || PTR_IS_LOCAL_INFILE(ptr) ||
-            PTR_IS_OK(ptr) || !my_session->multipacket[branch])
-        {
-            my_session->waiting[branch] = false;
-            my_session->multipacket[branch] = false;
-            if (PTR_IS_OK(ptr))
-            {
-                flags = get_response_flags(ptr, true);
-                more_results = (flags & 0x08) && my_session->client_multistatement;
-                if (more_results)
-                {
-                    skygw_log_write(LOGFILE_TRACE,
-                                    "Tee: [%s] waiting for more results.", branch == PARENT ? "PARENT" : "CHILD");
-                }
-            }
-        }
-#ifdef SS_DEBUG
-        else
-        {
-            skygw_log_write_flush(LOGFILE_DEBUG, "tee.c: [%d] Waiting for a result set from %s session.",
-                                  my_session->d_id,
-                                  branch == PARENT ? "parent" : "child");
-        }
-#endif
-    }
-
-    if (my_session->waiting[branch])
-    {
-        eof = modutil_count_signal_packets(complete, my_session->use_ok, my_session->eof[branch] > 0, &more_results);
-        more_results &= my_session->client_multistatement;
-        my_session->eof[branch] += eof;
-
-        if (my_session->eof[branch] >= min_eof)
-        {
-#ifdef SS_DEBUG
-            skygw_log_write_flush(LOGFILE_DEBUG, "tee.c [%d] %s received last EOF packet",
-                                  my_session->d_id,
-                                  branch == PARENT ? "parent" : "child");
-#endif
-            my_session->waiting[branch] = more_results;
-            if (more_results)
-            {
-                my_session->eof[branch] = 0;
-            }
-        }
-    }
-
-    if (branch == PARENT)
-    {
-        my_session->tee_replybuf = gwbuf_append(my_session->tee_replybuf, complete);
-    }
-    else
-    {
-        gwbuf_free(complete);
-    }
-
-    my_session->replies[branch]++;
-    rc = 1;
-    mpkt = my_session->multipacket[PARENT] || my_session->multipacket[CHILD];
-
-    if (my_session->tee_replybuf != NULL)
-    {
-
-        if (my_session->branch_session == NULL)
-        {
-            rc = 0;
-            gwbuf_free(my_session->tee_replybuf);
-            my_session->tee_replybuf = NULL;
-            skygw_log_write_flush(LOGFILE_ERROR, "Error : Tee child session was closed.");
-        }
-
-        if (mpkt)
-        {
-
-            if (my_session->waiting[PARENT])
-            {
-                route = true;
-
-            }
-            else if (my_session->eof[PARENT] >= min_eof &&
-                     my_session->eof[CHILD] >= min_eof)
-            {
-                route = true;
-#ifdef SS_DEBUG
-                skygw_log_write_flush(LOGFILE_DEBUG, "tee.c:[%d] Routing final packet of response set.", my_session->d_id);
-#endif
-            }
-        }
-        else if (!my_session->waiting[PARENT] &&
-                 !my_session->waiting[CHILD])
-        {
-#ifdef SS_DEBUG
-            skygw_log_write_flush(LOGFILE_DEBUG, "tee.c:[%d] Routing single packet response.", my_session->d_id);
-#endif
-            route = true;
-        }
-    }
-
-    if (route)
-    {
-#ifdef SS_DEBUG
-        skygw_log_write_flush(LOGFILE_DEBUG, "tee.c:[%d] Routing buffer '%p' parent(waiting [%s] replies [%d] eof[%d])"
-                              " child(waiting [%s] replies[%d] eof [%d])",
-                              my_session->d_id,
-                              my_session->tee_replybuf,
-                              my_session->waiting[PARENT] ? "true" : "false",
-                              my_session->replies[PARENT],
-                              my_session->eof[PARENT],
-                              my_session->waiting[CHILD] ? "true" : "false",
-                              my_session->replies[CHILD],
-                              my_session->eof[CHILD]);
-#endif
-
-        rc = my_session->up.clientReply(my_session->up.instance,
-                                        my_session->up.session,
-                                        my_session->tee_replybuf);
-        my_session->tee_replybuf = NULL;
-    }
-
-    if (my_session->queue &&
-        !my_session->waiting[PARENT] &&
-        !my_session->waiting[CHILD])
-    {
-        GWBUF* buffer = modutil_get_next_MySQL_packet(&my_session->queue);
-        GWBUF* clone = clone_query(my_session->instance, my_session, buffer);
-        reset_session_state(my_session, buffer);
-        route_single_query(my_session->instance, my_session, buffer, clone);
-        LOGIF(LT, (skygw_log_write(LT, "tee: routing queued query")));
-
-    }
-
-retblock:
-#ifdef SS_DEBUG
-    skygw_log_write(LT, "Status: Parent[%s] Child[%s]",
-                    my_session->waiting[PARENT] ? "WAITING" : "DONE",
-                    my_session->waiting[CHILD] ? "WAITING" : "DONE");
-    skygw_log_write(LT, "Replies: Parent[%d] Child[%d]",
-                    my_session->replies[PARENT],
-                    my_session->replies[CHILD]);
-
-#endif
     spinlock_release(&my_session->tee_lock);
 
     return rc;
@@ -1382,4 +1279,142 @@ int reset_session_state(TEE_SESSION* my_session, GWBUF* buffer)
     my_session->command = command;
 
     return 1;
+}
+
+/**
+ * Append a reply to the chain of stored replies for a particular branch.
+ * @param my_session Tee session
+ * @param reply Reply buffer
+ * @param branch PARENT or CHILD branch
+ * @return Pointer to at least one complete packet or NULL if none are available
+ */
+GWBUF* get_complete_replies(TEE_SESSION* my_session, GWBUF* reply, int branch)
+{
+    GWBUF* complete = NULL;
+
+    my_session->tee_partials[branch] = gwbuf_append(my_session->tee_partials[branch], reply);
+    my_session->tee_partials[branch] = gwbuf_make_contiguous(my_session->tee_partials[branch]);
+    complete = modutil_get_complete_packets(&my_session->tee_partials[branch]);
+
+    if (complete)
+    {
+        complete = gwbuf_make_contiguous(complete);
+
+        if (my_session->tee_partials[branch] &&
+            GWBUF_EMPTY(my_session->tee_partials[branch]))
+        {
+            gwbuf_free(my_session->tee_partials[branch]);
+            my_session->tee_partials[branch] = NULL;
+        }
+
+    }
+    else
+    {
+        /** Incomplete packet */
+        skygw_log_write(LOGFILE_DEBUG, "tee.c: Incomplete packet, "
+                        "waiting for a complete packet before forwarding.");
+    }
+    return complete;
+}
+/**
+ * Process the first reply from either the parent or child branch.
+ * @param my_session Tee session
+ * @param ptr Pointer to the start of the reply buffer
+ * @param branch Parent or child branch
+ * @return True if there will be multiple replies and false if this is the last one
+ */
+void process_first_reply(TEE_SESSION *my_session, uint8_t *ptr, int branch)
+{
+#ifdef SS_DEBUG
+    skygw_log_write(LOGFILE_TRACE, "Tee clientReply [%s] [%s] [%s]",
+                    branch == PARENT ? "parent" : "child",
+                    my_session->active ? "open" : "closed",
+                    PTR_IS_ERR(ptr) ? "ERR" : PTR_IS_OK(ptr) ? "OK" : "RSET");
+
+    skygw_log_write(LOGFILE_TRACE, "Tee: First reply to a query for [%s].", branch == PARENT ? "PARENT" : "CHILD");
+#endif
+
+    /* Reply is in a single packet if it is an OK, ERR or LOCAL_INFILE packet.
+         * Otherwise the reply is a result set and the amount of packets is unknown.
+         */
+        if (PTR_IS_ERR(ptr) || PTR_IS_LOCAL_INFILE(ptr) ||
+            PTR_IS_OK(ptr) || !my_session->multipacket[branch])
+        {
+            my_session->waiting[branch] = false;
+            my_session->multipacket[branch] = false;
+        }
+#ifdef SS_DEBUG
+        else
+        {
+            skygw_log_write_flush(LOGFILE_DEBUG, "tee.c: [%d] Waiting for a result set from %s session.",
+                                  my_session->d_id,
+                                  branch == PARENT ? "parent" : "child");
+        }
+#endif
+}
+
+/**
+ * Check if the reply is an OK packet and if the multi-result flag is set
+ * @param my_session Tee session
+ * @param ptr Pointer to the start of a complete reply packet
+ * @return True if this is a response with multiple result sets
+ */
+bool is_multipacket_reply(TEE_SESSION *my_session, uint8_t *ptr)
+{
+    if (PTR_IS_OK(ptr))
+    {
+        uint16_t flags = get_response_flags(ptr, true);
+        if ((flags & 0x08) && my_session->client_multistatement)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+/**
+ * Check if the conditions to route a reply to the client have been met
+ * @param my_session Tee session
+ * @return True if all stored replies can be sent to the client
+ */
+bool reply_is_ready(TEE_SESSION *my_session)
+{
+    bool route = false;
+
+    if (my_session->tee_replybuf != NULL)
+    {
+        if (my_session->branch_session)
+        {
+            if (my_session->multipacket[PARENT] || my_session->multipacket[CHILD])
+            {
+                int min_eof = my_session->command != 0x04 ? 2 : 1;
+                if (my_session->waiting[PARENT])
+                {
+                    /** As long as the parent branch is waiting for a reply, we can
+                     * send partial replies to the client */
+                    route = true;
+                }
+                else if (my_session->eof[PARENT] >= min_eof &&
+                         my_session->eof[CHILD] >= min_eof)
+                {
+                    /** Both branches have received a complete result set */
+                    route = true;
+                }
+            }
+            else if (!my_session->waiting[PARENT] &&
+                     !my_session->waiting[CHILD])
+            {
+                /** Both branches have received all their replies */
+                route = true;
+            }
+        }
+        else
+        {
+            gwbuf_free(my_session->tee_replybuf);
+            my_session->tee_replybuf = NULL;
+            skygw_log_write_flush(LOGFILE_ERROR, "Error : Tee child session was closed.");
+            return route = false;
+        }
+    }
+
+    return route;
 }
